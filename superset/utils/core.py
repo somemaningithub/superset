@@ -56,6 +56,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     NamedTuple,
     Optional,
     Sequence,
@@ -69,8 +70,8 @@ from typing import (
 from urllib.parse import unquote_plus
 from zipfile import ZipFile
 
-import bleach
 import markdown as md
+import nh3
 import numpy as np
 import pandas as pd
 import sqlalchemy as sa
@@ -655,15 +656,15 @@ def error_msg_from_exception(ex: Exception) -> str:
     """
     msg = ""
     if hasattr(ex, "message"):
-        if isinstance(ex.message, dict):  # type: ignore
+        if isinstance(ex.message, dict):
             msg = ex.message.get("message")  # type: ignore
-        elif ex.message:  # type: ignore
-            msg = ex.message  # type: ignore
+        elif ex.message:
+            msg = ex.message
     return msg or str(ex)
 
 
 def markdown(raw: str, markup_wrap: Optional[bool] = False) -> str:
-    safe_markdown_tags = [
+    safe_markdown_tags = {
         "h1",
         "h2",
         "h3",
@@ -689,10 +690,10 @@ def markdown(raw: str, markup_wrap: Optional[bool] = False) -> str:
         "dt",
         "img",
         "a",
-    ]
+    }
     safe_markdown_attrs = {
-        "img": ["src", "alt", "title"],
-        "a": ["href", "alt", "title"],
+        "img": {"src", "alt", "title"},
+        "a": {"href", "alt", "title"},
     }
     safe = md.markdown(
         raw or "",
@@ -702,7 +703,8 @@ def markdown(raw: str, markup_wrap: Optional[bool] = False) -> str:
             "markdown.extensions.codehilite",
         ],
     )
-    safe = bleach.clean(safe, safe_markdown_tags, safe_markdown_attrs)
+    # pylint: disable=no-member
+    safe = nh3.clean(safe, tags=safe_markdown_tags, attributes=safe_markdown_attrs)
     if markup_wrap:
         safe = Markup(safe)
     return safe
@@ -1667,7 +1669,7 @@ def get_form_data_token(form_data: Dict[str, Any]) -> str:
     return form_data.get("token") or "token_" + uuid.uuid4().hex[:8]
 
 
-def get_column_name_from_column(column: Column) -> Optional[str]:
+def get_column_name_from_column(column: Column) -> Optional[Column]:
     """
     Extract the physical column that a column is referencing. If the column is
     an adhoc column, always returns `None`.
@@ -1677,10 +1679,12 @@ def get_column_name_from_column(column: Column) -> Optional[str]:
     """
     if is_adhoc_column(column):
         return None
-    return column  # type: ignore
+    return column
 
 
-def get_column_names_from_columns(columns: List[Column]) -> List[str]:
+def get_column_names_from_columns(
+    columns: List[Column],
+) -> List[Union[AdhocColumn, str]]:
     """
     Extract the physical columns that a list of columns are referencing. Ignore
     adhoc columns
@@ -1785,7 +1789,7 @@ def indexed(
     return idx
 
 
-def is_test() -> bool:
+def is_test() -> Literal[0, 1]:
     return strtobool(os.environ.get("SUPERSET_TESTENV", "false"))
 
 
@@ -1793,7 +1797,6 @@ def get_time_filter_status(
     datasource: "BaseDatasource",
     applied_time_extras: Dict[str, str],
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-
     temporal_columns: Set[Any]
     if datasource.type == "query":
         temporal_columns = {
@@ -1996,6 +1999,25 @@ def create_zip(files: Dict[str, Any]) -> BytesIO:
                 fp.write(contents)
     buf.seek(0)
     return buf
+
+
+def check_is_safe_zip(zip_file: ZipFile) -> None:
+    """
+    Checks whether a ZIP file is safe, raises SupersetException if not.
+
+    :param zip_file:
+    :return:
+    """
+    uncompress_size = 0
+    compress_size = 0
+    for zip_file_element in zip_file.infolist():
+        if zip_file_element.file_size > current_app.config["ZIPPED_FILE_MAX_SIZE"]:
+            raise SupersetException("Found file with size above allowed threshold")
+        uncompress_size += zip_file_element.file_size
+        compress_size += zip_file_element.compress_size
+    compress_ratio = uncompress_size / compress_size
+    if compress_ratio > current_app.config["ZIP_FILE_MAX_COMPRESS_RATIO"]:
+        raise SupersetException("Zip compress ratio above allowed threshold")
 
 
 def remove_extra_adhoc_filters(form_data: Dict[str, Any]) -> None:

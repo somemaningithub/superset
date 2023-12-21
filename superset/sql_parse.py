@@ -18,11 +18,13 @@ import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, cast, Iterator, List, Optional, Set, Tuple
+from typing import Any, cast, Dict, Iterator, List, Optional, Set, Tuple
 from urllib import parse
 
 import sqlparse
 from sqlalchemy import and_
+from sqlparse import keywords
+from sqlparse.lexer import Lexer
 from sqlparse.sql import (
     Identifier,
     IdentifierList,
@@ -59,15 +61,13 @@ CTE_PREFIX = "CTE__"
 
 logger = logging.getLogger(__name__)
 
-
 # TODO: Workaround for https://github.com/andialbrecht/sqlparse/issues/652.
-sqlparse.keywords.SQL_REGEX.insert(
-    0,
-    (
-        re.compile(r"'(''|\\\\|\\|[^'])*'", sqlparse.keywords.FLAGS).match,
-        sqlparse.tokens.String.Single,
-    ),
-)
+# configure the Lexer to extend sqlparse
+# reference: https://sqlparse.readthedocs.io/en/stable/extending/
+lex = Lexer.get_default_instance()
+sqlparser_sql_regex = keywords.SQL_REGEX
+sqlparser_sql_regex.insert(25, (r"'(''|\\\\|\\|[^'])*'", sqlparse.tokens.String.Single))
+lex.set_SQL_REGEX(sqlparser_sql_regex)
 
 
 class CtasMethod(str, Enum):
@@ -216,9 +216,55 @@ class ParsedQuery:
     def limit(self) -> Optional[int]:
         return self._limit
 
+    def _get_cte_tables(  # pylint: disable=no-self-use
+        self, parsed: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        if "with" not in parsed:
+            return []
+        return parsed["with"].get("cte_tables", [])
+
+    def _check_cte_is_select(self, oxide_parse: List[Dict[str, Any]]) -> bool:
+        """
+        Check if a oxide parsed CTE contains only SELECT statements
+
+        :param oxide_parse: parsed CTE
+        :return: True if CTE is a SELECT statement
+        """
+        for query in oxide_parse:
+            parsed_query = query["Query"]
+            cte_tables = self._get_cte_tables(parsed_query)
+            for cte_table in cte_tables:
+                is_select = all(
+                    key == "Select" for key in cte_table["query"]["body"].keys()
+                )
+                if not is_select:
+                    return False
+        return True
+
     def is_select(self) -> bool:
         # make sure we strip comments; prevents a bug with coments in the CTE
         parsed = sqlparse.parse(self.strip_comments())
+
+        # Check if this is a CTE
+        if parsed[0].is_group and parsed[0][0].ttype == Keyword.CTE:
+            if sqloxide_parse is not None:
+                try:
+                    if not self._check_cte_is_select(
+                        sqloxide_parse(self.strip_comments(), dialect="ansi")
+                    ):
+                        return False
+                except ValueError:
+                    # sqloxide was not able to parse the query, so let's continue with
+                    # sqlparse
+                    pass
+            inner_cte = self.get_inner_cte_expression(parsed[0].tokens) or []
+            # Check if the inner CTE is a not a SELECT
+            if any(token.ttype == DDL for token in inner_cte) or any(
+                token.ttype == DML and token.normalized != "SELECT"
+                for token in inner_cte
+            ):
+                return False
+
         if parsed[0].get_type() == "SELECT":
             return True
 
@@ -239,6 +285,17 @@ class ParsedQuery:
         return any(
             token.ttype == DML and token.value == "SELECT" for token in parsed[0]
         )
+
+    def get_inner_cte_expression(self, tokens: TokenList) -> Optional[TokenList]:
+        for token in tokens:
+            if self._is_identifier(token):
+                for identifier_token in token.tokens:
+                    if (
+                        isinstance(identifier_token, Parenthesis)
+                        and identifier_token.is_group
+                    ):
+                        return identifier_token.tokens
+        return None
 
     def is_valid_ctas(self) -> bool:
         parsed = sqlparse.parse(self.strip_comments())
@@ -767,10 +824,10 @@ def extract_table_references(
         """
         Find all nodes in a SQL tree matching a given key.
         """
-        if isinstance(element, list):
+        if isinstance(element, List):
             for child in element:
                 yield from find_nodes_by_key(child, target)
-        elif isinstance(element, dict):
+        elif isinstance(element, Dict):
             for key, value in element.items():
                 if key == target:
                     yield value

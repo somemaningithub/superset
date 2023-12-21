@@ -803,7 +803,7 @@ class DashboardRestApi(BaseSupersetModelRestApi):
                 buf,
                 mimetype="application/zip",
                 as_attachment=True,
-                attachment_filename=filename,
+                download_name=filename,
             )
             if token:
                 response.set_cookie(token, "done", max_age=600)
@@ -813,7 +813,7 @@ class DashboardRestApi(BaseSupersetModelRestApi):
             Dashboard.id.in_(requested_ids)
         )
         query = self._base_filters.apply_all(query)
-        ids = [item.id for item in query.all()]
+        ids = {item.id for item in query.all()}
         if not ids:
             return self.response_404()
         export = Dashboard.export_dashboards(ids)

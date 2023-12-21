@@ -100,6 +100,7 @@ config = app.config
 logger = logging.getLogger(__name__)
 
 VIRTUAL_TABLE_ALIAS = "virtual_table"
+SERIES_LIMIT_SUBQ_ALIAS = "series_limit"
 ADVANCED_DATA_TYPES = config["ADVANCED_DATA_TYPES"]
 
 
@@ -184,7 +185,7 @@ class ImportExportMixin:
     __mapper__: Mapper
 
     @classmethod
-    def _unique_constrains(cls) -> List[Set[str]]:
+    def _unique_constraints(cls) -> List[Set[str]]:
         """Get all (single column and multi column) unique constraints"""
         unique = [
             {c.name for c in u.columns}
@@ -246,6 +247,7 @@ class ImportExportMixin:
         parent: Optional[Any] = None,
         recursive: bool = True,
         sync: Optional[List[str]] = None,
+        allow_reparenting: bool = False,
     ) -> Any:
         """Import obj from a dictionary"""
         if sync is None:
@@ -258,7 +260,7 @@ class ImportExportMixin:
             | {"uuid"}
         )
         new_children = {c: dict_rep[c] for c in cls.export_children if c in dict_rep}
-        unique_constrains = cls._unique_constrains()
+        unique_constraints = cls._unique_constraints()
 
         filters = []  # Using these filters to check if obj already exists
 
@@ -279,8 +281,11 @@ class ImportExportMixin:
             for k, v in parent_refs.items():
                 dict_rep[k] = getattr(parent, v)
 
-        # Add filter for parent obj
-        filters.extend([getattr(cls, k) == dict_rep.get(k) for k in parent_refs.keys()])
+        if not allow_reparenting:
+            # Add filter for parent obj
+            filters.extend(
+                [getattr(cls, k) == dict_rep.get(k) for k in parent_refs.keys()]
+            )
 
         # Add filter for unique constraints
         ucs = [
@@ -291,7 +296,7 @@ class ImportExportMixin:
                     if dict_rep.get(k) is not None
                 ]
             )
-            for cs in unique_constrains
+            for cs in unique_constraints
         ]
         filters.append(or_(*ucs))
 
@@ -1383,7 +1388,13 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         }
         columns = columns or []
         groupby = groupby or []
-        series_column_names = utils.get_column_names(series_columns or [])
+        db_engine_spec = self.db_engine_spec
+        series_column_labels = [
+            db_engine_spec.make_label_compatible(column)
+            for column in utils.get_column_names(
+                columns=series_columns or [],
+            )
+        ]
         # deprecated, to be removed in 2.0
         if is_timeseries and timeseries_limit:
             series_limit = timeseries_limit
@@ -1396,7 +1407,6 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
         template_kwargs["removed_filters"] = removed_filters
         template_kwargs["applied_filters"] = applied_template_filters
         template_processor = self.get_template_processor(**template_kwargs)
-        db_engine_spec = self.db_engine_spec
         prequeries: List[str] = []
         orderby = orderby or []
         need_groupby = bool(metrics is not None or groupby)
@@ -1537,8 +1547,8 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     )
                 groupby_all_columns[outer.name] = outer
                 if (
-                    is_timeseries and not series_column_names
-                ) or outer.name in series_column_names:
+                    is_timeseries and not series_column_labels
+                ) or outer.name in series_column_labels:
                     groupby_series_columns[outer.name] = outer
                 select_exprs.append(outer)
         elif columns:
@@ -1918,7 +1928,7 @@ class ExploreMixin:  # pylint: disable=too-many-public-methods
                     col_name = db_engine_spec.make_label_compatible(gby_name + "__")
                     on_clause.append(gby_obj == sa.column(col_name))
 
-                tbl = tbl.join(subq.alias(), and_(*on_clause))
+                tbl = tbl.join(subq.alias(SERIES_LIMIT_SUBQ_ALIAS), and_(*on_clause))
 
                 # run prequery to get top groups
                 prequery_obj = {
